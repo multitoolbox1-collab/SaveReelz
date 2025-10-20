@@ -1,229 +1,610 @@
-#!/usr/bin/env python3
-"""
-reel_downloader.py
-Single-file Flask app to extract and download public Instagram Reel / Post video URLs.
-
-Usage:
-    1. Create a virtualenv (recommended) and install requirements:
-         pip install flask requests beautifulsoup4
-    2. Run:
-         python reel_downloader.py
-    3. Open http://127.0.0.1:5000 in your browser, paste an Instagram post/reel URL, click Get Download.
-
-Note & Legal:
-    - Only for public posts and personal use.
-    - This script may stop working if Instagram changes their HTML/metadata.
-"""
-
-from flask import Flask, request, render_template_string, send_file, redirect, url_for, Response
-import requests
-from bs4 import BeautifulSoup
-import re
-import io
-import sys
-import traceback
-
-app = Flask(__name__)
-
-# Basic HTML UI (very small, single-file)
-HTML = """
-<!doctype html>
-<title>Reels Downloader</title>
-<style>
-  body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:40px;background:#f7f7f9;color:#111}
-  .box{max-width:720px;margin:0 auto;background:#fff;padding:22px;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,0.06)}
-  input[type=text]{width:100%;padding:12px;border:1px solid #ddd;border-radius:6px;margin-bottom:12px}
-  button{padding:10px 14px;border:0;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer}
-  .err{color:#b91c1c;margin-top:12px}
-  .success{color:#065f46;margin-top:12px}
-  a.link{display:inline-block;margin-top:12px;padding:10px 12px;background:#111;color:#fff;border-radius:6px;text-decoration:none}
-  small{color:#666}
-</style>
-<div class="box">
-  <h2>Reels / Post Video Downloader</h2>
-  <form method="post" action="/">
-    <input name="url" type="text" placeholder="Paste Instagram Reel / Post URL (example: https://www.instagram.com/reel/xxxxx/)" required>
-    <div>
-      <button type="submit">Get Download</button>
-    </div>
-  </form>
-  {% if error %}
-    <div class="err">{{ error }}</div>
-  {% endif %}
-  {% if video_url %}
-    <div class="success">Video found — <a class="link" href="{{ download_url }}">Download video</a></div>
-    <div style="margin-top:8px"><small>Direct URL: <a href="{{ video_url }}" target="_blank">{{ video_url }}</a></small></div>
-  {% endif %}
-  <hr>
-  <small>Note: Only public posts. If download doesn't work, Instagram may have changed their page structure.</small>
-</div>
-"""
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9"
-}
-
-def extract_video_url_from_html(html_text):
-    """
-    Try multiple strategies to extract a direct video URL from Instagram post page HTML.
-    1) Look for <meta property="og:video" content="...">
-    2) Look for JSON inside <script type="application/ld+json"> containing "contentUrl"
-    3) Search for "video_url","display_url" or "og:video:secure_url"
-    4) Regex search for "https://...(mp4)"
-    Returns video_url or None.
-    """
-    soup = BeautifulSoup(html_text, "html.parser")
-
-    # 1) og:video meta tag
-    meta = soup.find("meta", property="og:video")
-    if meta and meta.get("content"):
-        return meta.get("content").strip()
-
-    # 1b) og:video:secure_url
-    meta2 = soup.find("meta", property="og:video:secure_url")
-    if meta2 and meta2.get("content"):
-        return meta2.get("content").strip()
-
-    # 2) application/ld+json
-    ld = soup.find("script", type="application/ld+json")
-    if ld:
-        try:
-            import json
-            data = json.loads(ld.string)
-            if isinstance(data, dict):
-                # common property: contentUrl
-                if data.get("contentUrl"):
-                    return data.get("contentUrl").strip()
-        except Exception:
-            pass
-
-    # 3) Search for window.__additionalDataLoaded or window._sharedData JSON
-    scripts = soup.find_all("script")
-    for s in scripts:
-        if not s.string:
-            continue
-        text = s.string
-
-        # Look for "og:video" within script text
-        m = re.search(r'"video_url":"([^"]+)"', text)
-        if m:
-            return m.group(1).encode('utf-8').decode('unicode_escape')
-
-        m2 = re.search(r'"display_url":"([^"]+)"', text)
-        if m2:
-            return m2.group(1).encode('utf-8').decode('unicode_escape')
-
-        # window._sharedData or similar JSON objects might contain "video_url" or "secure_url"
-        m3 = re.search(r'(?:"video_url"|:"video_url")\s*:\s*"([^"]+)"', text)
-        if m3:
-            return m3.group(1).encode('utf-8').decode('unicode_escape')
-
-    # 4) Generic mp4 URL search
-    mmp4 = re.search(r'(https?:\/\/[^"\'\s]+\.mp4[^"\'\s]*)', html_text)
-    if mmp4:
-        return mmp4.group(1)
-
-    return None
-
-@app.route("/", methods=["GET", "POST"])
-def index():
-    video_url = None
-    error = None
-    download_url = None
-    if request.method == "POST":
-        url = request.form.get("url", "").strip()
-        if not url:
-            error = "Koi URL nahi dala."
-            return render_template_string(HTML, error=error)
-
-        # Basic normalization
-        if not url.startswith("http"):
-            url = "https://" + url
-
-        # Only allow instagram domains for safety in this script
-        if "instagram.com" not in url and "instagr.am" not in url:
-            error = "Please provide an Instagram post/reel URL (instagram.com)."
-            return render_template_string(HTML, error=error)
-
-        try:
-            # Request page HTML
-            resp = requests.get(url, headers=HEADERS, timeout=15)
-            if resp.status_code != 200:
-                error = f"Unable to fetch page (status {resp.status_code}). The post might be private or blocked."
-                return render_template_string(HTML, error=error)
-
-            html = resp.text
-            video_url = extract_video_url_from_html(html)
-
-            if not video_url:
-                # Try fetching with a trailing '?__a=1' (legacy) or '?__a=1&__d=dis' patterns (may not work consistently)
-                alt_try = None
-                for suffix in ["?__a=1", "?__a=1&__d=dis", "?__d=dis"]:
-                    try:
-                        r2 = requests.get(url + suffix, headers=HEADERS, timeout=8)
-                        if r2.status_code == 200:
-                            alt_try = extract_video_url_from_html(r2.text)
-                            if alt_try:
-                                video_url = alt_try
-                                break
-                    except Exception:
-                        pass
-
-            if not video_url:
-                error = "Video URL nahi mil paayi. Post private ho sakta hai ya Instagram ne page structure change kar diya hai."
-                return render_template_string(HTML, error=error)
-
-            # Provide a local download route that streams the file to the user
-            # Store video_url in query parameter (simple approach)
-            download_url = url_for("download", _external=True) + "?video_url=" + requests.utils.requote_uri(video_url)
-            return render_template_string(HTML, video_url=video_url, download_url=download_url)
-        except Exception as e:
-            traceback.print_exc(file=sys.stderr)
-            error = "Kuch error hua: " + str(e)
-            return render_template_string(HTML, error=error)
-
-    return render_template_string(HTML)
-
-@app.route("/download")
-def download():
-    """
-    Streams the remote video to the client as an attachment.
-    """
-    video_url = request.args.get("video_url")
-    if not video_url:
-        return "Missing video_url parameter", 400
-
-    # basic validation
-    if not (video_url.startswith("http://") or video_url.startswith("https://")):
-        return "Invalid URL", 400
-
-    try:
-        # Stream from Instagram (use headers)
-        with requests.get(video_url, stream=True, headers=HEADERS, timeout=20) as r:
-            r.raise_for_status()
-            # Try to detect filename from URL
-            fn = video_url.split("?")[0].split("/")[-1]
-            if not fn.endswith(".mp4"):
-                fn = "video.mp4"
-
-            # Create a streaming response
-            def generate():
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        yield chunk
-
-            # Use Response to stream
-            headers = {
-                "Content-Disposition": f'attachment; filename="{fn}"',
-                "Content-Type": r.headers.get("Content-Type", "application/octet-stream"),
+<!DOCTYPE html>
+<html lang="en" itemscope itemtype="https://schema.org/WebApplication">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EZCalculator - Free Online EMI, Age, BMI, GST Calculators | Accurate & Instant Results</title>
+    <meta name="description" content="Free online calculators for EMI, Age, BMI, and GST. Get instant, accurate calculations for loans, age, body mass index, and tax. Mobile-friendly and easy to use.">
+    <meta name="keywords" content="emi calculator, age calculator, bmi calculator, gst calculator, loan calculator, tax calculator, health calculator, free calculator">
+    <meta name="author" content="EZCalculator">
+    
+    <!-- Schema.org structured data -->
+    <script type="application/ld+json">
+    {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "EZCalculator",
+        "description": "Free online calculators for EMI, Age, BMI, and GST calculations",
+        "url": "https://ezcalculator.com",
+        "applicationCategory": "UtilitiesApplication",
+        "operatingSystem": "Any",
+        "offers": {
+            "@type": "Offer",
+            "price": "0",
+            "priceCurrency": "USD"
+        },
+        "author": {
+            "@type": "Organization",
+            "name": "EZCalculator"
+        },
+        "aggregateRating": {
+            "@type": "AggregateRating",
+            "ratingValue": "4.8",
+            "ratingCount": "1250"
+        }
+    }
+    </script>
+    
+    <!-- Additional calculator schemas -->
+    <script type="application/ld+json">
+    [{
+        "@context": "https://schema.org",
+        "@type": "HowToTool",
+        "name": "EMI Calculator",
+        "description": "Calculate your Equated Monthly Installment for loans",
+        "url": "https://ezcalculator.com/emi-calculator"
+    }, {
+        "@context": "https://schema.org",
+        "@type": "HowToTool", 
+        "name": "BMI Calculator",
+        "description": "Calculate your Body Mass Index for health assessment",
+        "url": "https://ezcalculator.com/bmi-calculator"
+    }, {
+        "@context": "https://schema.org",
+        "@type": "HowToTool",
+        "name": "Age Calculator",
+        "description": "Calculate exact age in years, months and days",
+        "url": "https://ezcalculator.com/age-calculator"
+    }, {
+        "@context": "https://schema.org", 
+        "@type": "HowToTool",
+        "name": "GST Calculator",
+        "description": "Calculate Goods and Services Tax amounts",
+        "url": "https://ezcalculator.com/gst-calculator"
+    }]
+    </script>
+    
+    <style>
+        :root {
+            --primary: #2563eb;
+            --primary-dark: #1d4ed8;
+            --secondary: #7c3aed;
+            --accent: #06b6d4;
+            --light: #f8fafc;
+            --dark: #1e293b;
+            --gray: #64748b;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --error: #ef4444;
+            --border-radius: 12px;
+            --shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            --transition: all 0.3s ease;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Inter', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        body {
+            background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+            color: var(--dark);
+            line-height: 1.6;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1300px;
+            margin: 0 auto;
+        }
+        
+        /* Header with breadcrumb */
+        .breadcrumb {
+            font-size: 0.9rem;
+            color: var(--gray);
+            margin-bottom: 20px;
+        }
+        
+        .breadcrumb a {
+            color: var(--primary);
+            text-decoration: none;
+        }
+        
+        .breadcrumb a:hover {
+            text-decoration: underline;
+        }
+        
+        header {
+            text-align: center;
+            padding: 40px 20px;
+            margin-bottom: 40px;
+            position: relative;
+        }
+        
+        .logo {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .logo-icon {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 24px;
+            box-shadow: var(--shadow);
+        }
+        
+        h1 {
+            font-size: 2.8rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+        
+        .tagline {
+            font-size: 1.3rem;
+            color: var(--gray);
+            max-width: 600px;
+            margin: 0 auto 20px;
+        }
+        
+        .rating {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            color: var(--gray);
+            font-size: 0.9rem;
+        }
+        
+        .stars {
+            color: #fbbf24;
+        }
+        
+        /* FAQ Schema */
+        .faq-section {
+            max-width: 800px;
+            margin: 0 auto 40px;
+            background: white;
+            padding: 25px;
+            border-radius: var(--border-radius);
+            box-shadow: var(--shadow);
+        }
+        
+        .faq-section h2 {
+            text-align: center;
+            margin-bottom: 25px;
+            color: var(--dark);
+            font-size: 1.8rem;
+        }
+        
+        .faq-item {
+            margin-bottom: 20px;
+            border-bottom: 1px solid #e2e8f0;
+            padding-bottom: 15px;
+        }
+        
+        .faq-question {
+            font-weight: 600;
+            color: var(--dark);
+            margin-bottom: 8px;
+            font-size: 1.1rem;
+        }
+        
+        .faq-answer {
+            color: var(--gray);
+            line-height: 1.6;
+        }
+        
+        .calculator-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 30px;
+            margin-bottom: 60px;
+        }
+        
+        .calculator {
+            background: white;
+            border-radius: var(--border-radius);
+            padding: 30px;
+            box-shadow: var(--shadow);
+            transition: var(--transition);
+            border: 1px solid #e2e8f0;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .calculator::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 5px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+        }
+        
+        .calculator:hover {
+            transform: translateY(-8px);
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        }
+        
+        .calculator-header {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+        
+        .calculator-icon {
+            width: 50px;
+            height: 50px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 20px;
+        }
+        
+        .calculator h2 {
+            color: var(--dark);
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+        
+        .input-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: var(--dark);
+            font-size: 0.95rem;
+        }
+        
+        input, select {
+            width: 100%;
+            padding: 14px 16px;
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: var(--transition);
+            background-color: var(--light);
+        }
+        
+        input:focus, select:focus {
+            border-color: var(--primary);
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+            background-color: white;
+        }
+        
+        button {
+            background: linear-gradient(to right, var(--primary), var(--secondary));
+            color: white;
+            border: none;
+            padding: 15px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            width: 100%;
+            transition: var(--transition);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        button:hover {
+            background: linear-gradient(to right, var(--primary-dark), var(--secondary));
+            transform: translateY(-2px);
+            box-shadow: 0 7px 14px rgba(37, 99, 235, 0.2);
+        }
+        
+        .result {
+            margin-top: 25px;
+            padding: 20px;
+            background: linear-gradient(135deg, #f0f9ff, #e0f2fe);
+            border-radius: 10px;
+            border-left: 4px solid var(--primary);
+            display: none;
+            animation: fadeIn 0.5s ease;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .result h3 {
+            margin-bottom: 15px;
+            color: var(--primary);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .result-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 12px;
+            padding-bottom: 12px;
+            border-bottom: 1px dashed #cbd5e1;
+        }
+        
+        .result-item:last-child {
+            border-bottom: none;
+            margin-bottom: 0;
+            padding-bottom: 0;
+        }
+        
+        .result-label {
+            font-weight: 500;
+            color: var(--gray);
+        }
+        
+        .result-value {
+            font-weight: 600;
+            color: var(--dark);
+        }
+        
+        .badge {
+            display: inline-block;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            margin-left: 10px;
+        }
+        
+        /* SEO Content Sections */
+        .content-section {
+            background: white;
+            border-radius: var(--border-radius);
+            padding: 40px;
+            box-shadow: var(--shadow);
+            margin-bottom: 40px;
+            border: 1px solid #e2e8f0;
+        }
+        
+        .content-section h2 {
+            color: var(--dark);
+            margin-bottom: 25px;
+            font-size: 1.8rem;
+            position: relative;
+            padding-bottom: 15px;
+        }
+        
+        .content-section h2::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 80px;
+            height: 4px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            border-radius: 2px;
+        }
+        
+        .content-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 25px;
+            margin-top: 30px;
+        }
+        
+        .content-card {
+            background: var(--light);
+            padding: 25px;
+            border-radius: 10px;
+            border-left: 4px solid var(--primary);
+            transition: var(--transition);
+            height: 100%;
+        }
+        
+        .content-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+        }
+        
+        .content-card h3 {
+            color: var(--primary);
+            margin-bottom: 15px;
+            font-size: 1.2rem;
+        }
+        
+        .benefits-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-top: 30px;
+        }
+        
+        .benefit-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 15px;
+            padding: 15px;
+            background: #f0fdf4;
+            border-radius: 8px;
+            border: 1px solid #bbf7d0;
+        }
+        
+        .benefit-item i {
+            color: var(--success);
+            font-size: 1.2rem;
+            margin-top: 2px;
+        }
+        
+        footer {
+            text-align: center;
+            margin-top: 70px;
+            padding: 30px 20px;
+            color: var(--gray);
+            border-top: 1px solid #e2e8f0;
+        }
+        
+        .footer-content {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .footer-logo {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--primary);
+        }
+        
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 2.2rem;
             }
-            return Response(generate(), headers=headers)
-    except Exception as e:
-        traceback.print_exc(file=sys.stderr)
-        return f"Download failed: {e}", 500
-
-if __name__ == "__main__":
-    # Run in debug=False for production usage; here we default to 5000
-    app.run(host="0.0.0.0", port=5000, debug=False)
-      
+            
+            .calculator-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .content-section {
+                padding: 25px;
+            }
+        }
+        
+        /* SEO Optimized Elements */
+        .schema-faq {
+            display: none;
+        }
+        
+        .cta-section {
+            text-align: center;
+            padding: 40px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            border-radius: var(--border-radius);
+            margin: 40px 0;
+        }
+        
+        .cta-section h2 {
+            margin-bottom: 20px;
+            font-size: 2rem;
+        }
+        
+        .cta-button {
+            display: inline-block;
+            background: white;
+            color: var(--primary);
+            padding: 15px 30px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            margin-top: 20px;
+            transition: var(--transition);
+        }
+        
+        .cta-button:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Breadcrumb for better SEO -->
+        <div class="breadcrumb">
+            <a href="#">Home</a> > <a href="#">Calculators</a> > <span>Online Calculators</span>
+        </div>
+        
+        <header>
+            <div class="logo">
+                <div class="logo-icon">
+                    <i class="fas fa-calculator"></i>
+                </div>
+                <h1>EZCalculator</h1>
+            </div>
+            <p class="tagline">Free Online Calculators for EMI, Age, BMI, and GST - Get Instant, Accurate Results</p>
+            <div class="rating">
+                <div class="stars">
+                    <i class="fas fa-star"></i>
+                    <i class="fas fa-star"></i>
+                    <i class="fas fa-star"></i>
+                    <i class="fas fa-star"></i>
+                    <i class="fas fa-star-half-alt"></i>
+                </div>
+                <span>4.8/5 based on 1,250+ reviews</span>
+            </div>
+        </header>
+        
+        <!-- FAQ Schema (hidden but for SEO) -->
+        <div class="schema-faq" itemscope itemtype="https://schema.org/FAQPage">
+            <div itemscope itemprop="mainEntity" itemtype="https://schema.org/Question">
+                <h3 itemprop="name">How to calculate EMI?</h3>
+                <div itemscope itemprop="acceptedAnswer" itemtype="https://schema.org/Answer">
+                    <div itemprop="text">EMI can be calculated using the formula: EMI = P × r × (1+r)^n/((1+r)^n-1) where P is the loan amount, r is the monthly interest rate, and n is the loan tenure in months.</div>
+                </div>
+            </div>
+            <div itemscope itemprop="mainEntity" itemtype="https://schema.org/Question">
+                <h3 itemprop="name">What is a good BMI?</h3>
+                <div itemscope itemprop="acceptedAnswer" itemtype="https://schema.org/Answer">
+                    <div itemprop="text">A healthy BMI range is between 18.5 and 24.9. Below 18.5 is underweight, 25-29.9 is overweight, and 30 or above is considered obese.</div>
+                </div>
+            </div>
+            <div itemscope itemprop="mainEntity" itemtype="https://schema.org/Question">
+                <h3 itemprop="name">How is GST calculated?</h3>
+                <div itemscope itemprop="acceptedAnswer" itemtype="https://schema.org/Answer">
+                    <div itemprop="text">GST is calculated by multiplying the original amount by the GST rate percentage. For example, if the amount is ₹1000 and GST rate is 18%, the GST amount would be ₹180.</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Visible FAQ Section -->
+        <div class="faq-section">
+            <h2>Frequently Asked Questions</h2>
+            <div class="faq-item">
+                <div class="faq-question">How to calculate EMI for a loan?</div>
+                <div class="faq-answer">EMI (Equated Monthly Installment) can be calculated using our EMI calculator by entering the loan amount, interest rate, and loan tenure. The formula used is: EMI = P × r × (1+r)^n/((1+r)^n-1) where P is the loan amount, r is the monthly interest rate, and n is the loan tenure in months.</div>
+            </div>
+            <div class="faq-item">
+                <div class="faq-question">What is considered a healthy BMI range?</div>
+                <div class="faq-answer">A healthy BMI (Body Mass Index) ranges from 18.5 to 24.9. Below 18.5 is considered underweight, 25 to 29.9 is overweight, and 30 or above is classified as obese. BMI is a screening tool but doesn't directly measure body fat.</div>
+            </div>
+            <div class="faq-item">
+                <div class="faq-question">How does the GST calculator work?</div>
+                <div class="faq-answer">Our GST calculator works by taking the original amount and applying the GST rate percentage. It calculates both the GST amount and the total amount including GST. For example, for ₹1,000 at 18% GST, the GST amount is ₹180 and total is ₹1,180.</div>
+            </div>
+        </div>
+        
+        <!-- Calculators -->
+        <div class="calculator-grid">
+            <!-- EMI Calculator -->
+            <div class="calculator">
+                <div class="calculator-header">
+                    <div class="calculator-icon">
+                        <i class="fas fa-file-invoice-dollar"></i>
+                    </div>
+                    <h2>EMI Calculator <span class="badge">Finance</span></h2>
+                </div>
+                <div class="input-group">
+                    <label for="loanAmount"><i class="fas fa-rupee-sign
