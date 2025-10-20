@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""
+reel_downloader.py
+Single-file Flask app to extract and download public Instagram Reel / Post video URLs.
+
+Usage:
+    1. Create a virtualenv (recommended) and install requirements:
+         pip install flask requests beautifulsoup4
+    2. Run:
+         python reel_downloader.py
+    3. Open http://127.0.0.1:5000 in your browser, paste an Instagram post/reel URL, click Get Download.
+
+Note & Legal:
+    - Only for public posts and personal use.
+    - This script may stop working if Instagram changes their HTML/metadata.
+"""
+
+from flask import Flask, request, render_template_string, send_file, redirect, url_for, Response
+import requests
+from bs4 import BeautifulSoup
+import re
+import io
+import sys
+import traceback
+
+app = Flask(__name__)
+
+# Basic HTML UI (very small, single-file)
+HTML = """
+<!doctype html>
+<title>Reels Downloader</title>
+<style>
+  body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:40px;background:#f7f7f9;color:#111}
+  .box{max-width:720px;margin:0 auto;background:#fff;padding:22px;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,0.06)}
+  input[type=text]{width:100%;padding:12px;border:1px solid #ddd;border-radius:6px;margin-bottom:12px}
+  button{padding:10px 14px;border:0;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer}
+  .err{color:#b91c1c;margin-top:12px}
+  .success{color:#065f46;margin-top:12px}
+  a.link{display:inline-block;margin-top:12px;padding:10px 12px;background:#111;color:#fff;border-radius:6px;text-decoration:none}
+  small{color:#666}
+</style>
+<div class="box">
+  <h2>Reels / Post Video Downloader</h2>
+  <form method="post" action="/">
+    <input name="url" type="text" placeholder="Paste Instagram Reel / Post URL (example: https://www.instagram.com/reel/xxxxx/)" required>
+    <div>
+      <button type="submit">Get Download</button>
+    </div>
+  </form>
+  {% if error %}
+    <div class="err">{{ error }}</div>
+  {% endif %}
+  {% if video_url %}
+    <div class="success">Video found — <a class="link" href="{{ download_url }}">Download video</a></div>
+    <div style="margin-top:8px"><small>Direct URL: <a href="{{ video_url }}" target="_blank">{{ video_url }}</a></small></div>
+  {% endif %}
+  <hr>
+  <small>Note: Only public posts. If download doesn't work, Instagram may have changed their page structure.</small>
+</div>
+"""
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9"
+}
+
+def extract_video_url_from_html(html_text):
+    """
+    Try multiple strategies to extract a direct video URL from Instagram post page HTML.
+    1) Look for <meta property="og:video" content="...">
+    2) Look for JSON inside <script type="application/ld+json"> containing "contentUrl"
+    3) Search for "video_url","display_url" or "og:video:secure_url"
+    4) Regex search for "https://...(mp4)"
+    Returns video_url or None.
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    # 1) og:video meta tag
+    meta = soup.find("meta", property="og:video")
+    if meta and meta.get("content"):
+        return meta.get("content").strip()
+
+    # 1b) og:video:secure_url
+    meta2 = soup.find("meta", property="og:video:secure_url")
+    if meta2 and meta2.get("content"):
+        return meta2.get("content").strip()
+
+    # 2) application/ld+json
+    ld = soup.find("script", type="application/ld+json")
+    if ld:
+        try:
+            import json
+            data = json.loads(ld.string)
+            if isinstance(data, dict):
+                # common property: contentUrl
+                if data.get("contentUrl"):
+                    return data.get("contentUrl").strip()
+        except Exception:
+            pass
+
+    # 3) Search for window.__additionalDataLoaded or window._sharedData JSON
+    scripts = soup.find_all("script")
+    for s in scripts:
+        if not s.string:
+            continue
+        text = s.string
+
+        # Look for "og:video" within script text
+        m = re.search(r'"video_url":"([^"]+)"', text)
+        if m:
+            return m.group(1).encode('utf-8').decode('unicode_escape')
+
+        m2 = re.search(r'"display_url":"([^"]+)"', text)
+        if m2:
+            return m2.group(1).encode('utf-8').decode('unicode_escape')
+
+        # window._sharedData or similar JSON objects might contain "video_url" or "secure_url"
+        m3 = re.search(r'(?:"video_url"|:"video_url")\s*:\s*"([^"]+)"', text)
+        if m3:
+            return m3.group(1).encode('utf-8').decode('unicode_escape')
+
+    # 4) Generic mp4 URL search
+    mmp4 = re.search(r'(https?:\/\/[^"\'\s]+\.mp4[^"\'\s]*)', html_text)
+    if mmp4:
+        return mmp4.group(1)
+
+    return None
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    video_url = None
+    error = None
+    download_url = None
+    if request.method == "POST":
+        url = request.form.get("url", "").strip()
+        if not url:
+            error = "Koi URL nahi dala."
+            return render_template_string(HTML, error=error)
+
+        # Basic normalization
+        if not url.startswith("http"):
+            url = "https://" + url
+
+        # Only allow instagram domains for safety in this script
+        if "instagram.com" not in url and "instagr.am" not in url:
+            error = "Please provide an Instagram post/reel URL (instagram.com)."
+            return render_template_string(HTML, error=error)
+
+        try:
+            # Request page HTML
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            if resp.status_code != 200:
+                error = f"Unable to fetch page (status {resp.status_code}). The post might be private or blocked."
+                return render_template_string(HTML, error=error)
+
+            html = resp.text
+            video_url = extract_video_url_from_html(html)
+
+            if not video_url:
+                # Try fetching with a trailing '?__a=1' (legacy) or '?__a=1&__d=dis' patterns (may not work consistently)
+                alt_try = None
+                for suffix in ["?__a=1", "?__a=1&__d=dis", "?__d=dis"]:
+                    try:
+                        r2 = requests.get(url + suffix, headers=HEADERS, timeout=8)
+                        if r2.status_code == 200:
+                            alt_try = extract_video_url_from_html(r2.text)
+                            if alt_try:
+                                video_url = alt_try
+                                break
+                    except Exception:
+                        pass
+
+            if not video_url:
+                error = "Video URL nahi mil paayi. Post private ho sakta hai ya Instagram ne page structure change kar diya hai."
+                return render_template_string(HTML, error=error)
+
+            # Provide a local download route that streams the file to the user
+            # Store video_url in query parameter (simple approach)
+            download_url = url_for("download", _external=True) + "?video_url=" + requests.utils.requote_uri(video_url)
+            return render_template_string(HTML, video_url=video_url, download_url=download_url)
+        except Exception as e:
+            traceback.print_exc(file=sys.stderr)
+            error = "Kuch error hua: " + str(e)
+            return render_template_string(HTML, error=error)
+
+    return render_template_string(HTML)
+
+@app.route("/download")
+def download():
+    """
+    Streams the remote video to the client as an attachment.
+    """
+    video_url = request.args.get("video_url")
+    if not video_url:
+        return "Missing video_url parameter", 400
+
+    # basic validation
+    if not (video_url.startswith("http://") or video_url.startswith("https://")):
+        return "Invalid URL", 400
+
+    try:
+        # Stream from Instagram (use headers)
+        with requests.get(video_url, stream=True, headers=HEADERS, timeout=20) as r:
+            r.raise_for_status()
+            # Try to detect filename from URL
+            fn = video_url.split("?")[0].split("/")[-1]
+            if not fn.endswith(".mp4"):
+                fn = "video.mp4"
+
+            # Create a streaming response
+            def generate():
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+
+            # Use Response to stream
+            headers = {
+                "Content-Disposition": f'attachment; filename="{fn}"',
+                "Content-Type": r.headers.get("Content-Type", "application/octet-stream"),
+            }
+            return Response(generate(), headers=headers)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return f"Download failed: {e}", 500
+
+if __name__ == "__main__":
+    # Run in debug=False for production usage; here we default to 5000
+    app.run(host="0.0.0.0", port=5000, debug=False)
+      
